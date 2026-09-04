@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATCH_DIR="/home/solo/tas2783-patches"
+MOK_PRIV="/root/module-signing/MOK.priv"
+MOK_DER="/root/module-signing/MOK.der"
+ROOT_WORK="/var/tmp/px13-audio-autofix"
+LOG="/var/log/px13-audio-autofix.log"
+
+mkdir -p "$ROOT_WORK"
+exec > >(tee -a "$LOG") 2>&1
+
+echo
+echo "==== PX13 AUDIO AUTOFIX: $(date) ===="
+
+# DNF/RPM hala calisiyorsa bekle.
+if pgrep -x dnf >/dev/null 2>&1 || \
+   pgrep -x dnf5 >/dev/null 2>&1 || \
+   pgrep -x rpm >/dev/null 2>&1; then
+    echo "DNF/RPM su an calisiyor. Timer daha sonra tekrar deneyecek."
+    exit 0
+fi
+
+# Gerekli komutlar.
+for cmd in dnf rpm tar patch make depmod modinfo find grep install awk sort; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "HATA: Gerekli komut bulunamadi: $cmd"
+        exit 1
+    }
+done
+
+# 16 TAS2783 patch mevcut mu?
+if [[ ! -d "$PATCH_DIR" ]]; then
+    echo "HATA: Patch klasoru bulunamadi:"
+    echo "$PATCH_DIR"
+    exit 1
+fi
+
+PATCH_COUNT="$(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' | wc -l)"
+
+if [[ "$PATCH_COUNT" -ne 16 ]]; then
+    echo "HATA: 16 patch bekleniyordu. Bulunan: $PATCH_COUNT"
+    exit 1
+fi
+
+# Secure Boot MOK anahtarlari mevcut mu?
+if [[ ! -f "$MOK_PRIV" || ! -f "$MOK_DER" ]]; then
+    echo "HATA: MOK imza dosyalari bulunamadi."
+    echo "$MOK_PRIV"
+    echo "$MOK_DER"
+    exit 1
+fi
+
+# Hem aktif kerneli hem de kurulmus en yeni kerneli kontrol et.
+CURRENT_KV="$(uname -r)"
+
+NEWEST_KV="$(
+    find /usr/src/kernels \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -printf '%f\n' \
+    | sort -V \
+    | tail -n 1 || true
+)"
+
+mapfile -t KERNELS < <(
+    printf "%s\n%s\n" "$CURRENT_KV" "$NEWEST_KV" \
+    | awk 'NF && !seen[$0]++'
+)
+
+if [[ "${#KERNELS[@]}" -eq 0 ]]; then
+    echo "HATA: Kernel-devel bulunamadi."
+    exit 1
+fi
+
+for KV in "${KERNELS[@]}"; do
+
+    [[ -d "/lib/modules/$KV" ]] || continue
+    [[ -d "/usr/src/kernels/$KV" ]] || continue
+
+    echo
+    echo "============================================"
+    echo "KERNEL: $KV"
+    echo "============================================"
+
+    CURRENT_PATHS="$(
+        modinfo -k "$KV" -n \
+            snd_soc_tas2783_sdw \
+            soundwire_amd \
+            snd_soc_sdw_utils \
+            snd_soc_core \
+            2>/dev/null || true
+    )"
+
+    FIX_COUNT="$(
+        grep -c '/updates/px13-audio/' <<< "$CURRENT_PATHS" || true
+    )"
+
+    if [[ "$FIX_COUNT" -eq 4 ]]; then
+        echo "Bu kernel zaten fixli:"
+        echo "$CURRENT_PATHS"
+        continue
+    fi
+
+    echo "Fix bulunamadi. Derleme basliyor."
+    echo "$CURRENT_PATHS"
+
+    KBASE="${KV%%-*}"
+
+    WORK="$ROOT_WORK/$KV"
+    TOP="$WORK/rpmbuild"
+    SRCDIR="$WORK/source-rpm"
+    TESTDIR="$WORK/linux-$KBASE-test"
+
+    rm -rf "$WORK"
+
+    mkdir -p \
+        "$TOP" \
+        "$SRCDIR"
+
+    TARBALL=""
+
+    # Daha once manuel olarak indirilmis kernel kaynagi varsa kullan.
+    for cand in \
+        "/home/solo/rpmbuild/SOURCES/linux-$KBASE.tar.xz" \
+        "/root/rpmbuild/SOURCES/linux-$KBASE.tar.xz"
+    do
+        if [[ -f "$cand" ]]; then
+            TARBALL="$cand"
+            echo "Mevcut kernel kaynagi kullaniliyor:"
+            echo "$TARBALL"
+            break
+        fi
+    done
+
+    # Ayni upstream kernel kaynagi eski bir autofix calismasinda varsa kullan.
+    if [[ -z "$TARBALL" ]]; then
+
+        CACHED_TAR="$(
+            find "$ROOT_WORK" \
+                -path "*/SOURCES/linux-$KBASE.tar.xz" \
+                -print \
+                -quit \
+                2>/dev/null || true
+        )"
+
+        if [[ -n "$CACHED_TAR" && -f "$CACHED_TAR" ]]; then
+            TARBALL="$CACHED_TAR"
+            echo "Cache kernel kaynagi kullaniliyor:"
+            echo "$TARBALL"
+        fi
+    fi
+
+    # Kaynak yoksa Fedora source RPM indir.
+    if [[ -z "$TARBALL" ]]; then
+
+        cd "$SRCDIR"
+
+        echo "Source RPM indiriliyor:"
+        echo "kernel-core-$KV"
+
+        dnf clean metadata || true
+
+        if ! dnf download --source "kernel-core-$KV"; then
+            echo "UYARI: Source RPM indirilemedi."
+            echo "Kernel atlandi: $KV"
+            echo "Timer daha sonra tekrar deneyecek."
+            continue
+        fi
+
+        SRPM="$(
+            ls kernel-"$KBASE"-*.src.rpm \
+                2>/dev/null \
+            | head -n 1 || true
+        )"
+
+        if [[ -z "$SRPM" ]]; then
+            echo "UYARI: Source RPM dosyasi bulunamadi."
+            echo "Kernel atlandi: $KV"
+            continue
+        fi
+
+        echo "Source RPM aciliyor:"
+        echo "$SRPM"
+
+        rpm -ivh \
+            --replacepkgs \
+            --define "_topdir $TOP" \
+            "$SRPM"
+
+        TARBALL="$TOP/SOURCES/linux-$KBASE.tar.xz"
+
+        if [[ ! -f "$TARBALL" ]]; then
+            echo "UYARI: Kernel kaynak arsivi bulunamadi:"
+            echo "$TARBALL"
+            echo "Kernel atlandi: $KV"
+            continue
+        fi
+    fi
+
+    echo
+    echo "Kernel kaynagi aciliyor:"
+    echo "linux-$KBASE"
+
+    tar -xf "$TARBALL" -C "$WORK"
+
+    rm -rf "$TESTDIR"
+
+    cp -a \
+        "$WORK/linux-$KBASE" \
+        "$TESTDIR"
+
+    cd "$TESTDIR"
+
+    echo
+    echo "16 TAS2783 patch uygulanıyor..."
+
+    for p in "$PATCH_DIR"/*.patch; do
+        echo "---- $(basename "$p")"
+        patch -p1 --batch < "$p"
+    done
+
+    echo
+    echo "Patched header kernel-devel icine kopyalaniyor..."
+
+    cp -a \
+        "/usr/src/kernels/$KV/include/sound/soc_sdw_utils.h" \
+        "/usr/src/kernels/$KV/include/sound/soc_sdw_utils.h.orig-px13-$KBASE" \
+        2>/dev/null || true
+
+    cp -a \
+        "$TESTDIR/include/sound/soc_sdw_utils.h" \
+        "/usr/src/kernels/$KV/include/sound/soc_sdw_utils.h"
+
+    echo
+    echo "4 kernel modulu derleniyor..."
+
+    make -C "/usr/src/kernels/$KV" \
+        M="$TESTDIR/sound/soc/codecs" \
+        snd-soc-tas2783-sdw.ko
+
+    make -C "/usr/src/kernels/$KV" \
+        M="$TESTDIR/drivers/soundwire" \
+        soundwire-amd.ko
+
+    make -C "/usr/src/kernels/$KV" \
+        M="$TESTDIR/sound/soc/sdw_utils" \
+        snd-soc-sdw-utils.ko
+
+    make -C "/usr/src/kernels/$KV" \
+        M="$TESTDIR/sound/soc" \
+        snd-soc-core.ko
+
+    SIGN="/usr/src/kernels/$KV/scripts/sign-file"
+
+    if [[ ! -x "$SIGN" ]]; then
+        echo "HATA: sign-file bulunamadi:"
+        echo "$SIGN"
+        exit 1
+    fi
+
+    echo
+    echo "Moduller MOK ile imzalaniyor..."
+
+    "$SIGN" sha256 \
+        "$MOK_PRIV" "$MOK_DER" \
+        "$TESTDIR/drivers/soundwire/soundwire-amd.ko"
+
+    "$SIGN" sha256 \
+        "$MOK_PRIV" "$MOK_DER" \
+        "$TESTDIR/sound/soc/codecs/snd-soc-tas2783-sdw.ko"
+
+    "$SIGN" sha256 \
+        "$MOK_PRIV" "$MOK_DER" \
+        "$TESTDIR/sound/soc/sdw_utils/snd-soc-sdw-utils.ko"
+
+    "$SIGN" sha256 \
+        "$MOK_PRIV" "$MOK_DER" \
+        "$TESTDIR/sound/soc/snd-soc-core.ko"
+
+    DST="/lib/modules/$KV/updates/px13-audio"
+
+    mkdir -p "$DST"
+
+    echo
+    echo "Moduller kuruluyor:"
+    echo "$DST"
+
+    install -m 644 \
+        "$TESTDIR/drivers/soundwire/soundwire-amd.ko" \
+        "$DST/"
+
+    install -m 644 \
+        "$TESTDIR/sound/soc/codecs/snd-soc-tas2783-sdw.ko" \
+        "$DST/"
+
+    install -m 644 \
+        "$TESTDIR/sound/soc/sdw_utils/snd-soc-sdw-utils.ko" \
+        "$DST/"
+
+    install -m 644 \
+        "$TESTDIR/sound/soc/snd-soc-core.ko" \
+        "$DST/"
+
+    depmod -a "$KV"
+
+    echo
+    echo "Modul kontrolu:"
+
+    FINAL_PATHS="$(
+        modinfo -k "$KV" -n \
+            snd_soc_tas2783_sdw \
+            soundwire_amd \
+            snd_soc_sdw_utils \
+            snd_soc_core
+    )"
+
+    echo "$FINAL_PATHS"
+
+    FINAL_COUNT="$(
+        grep -c '/updates/px13-audio/' <<< "$FINAL_PATHS" || true
+    )"
+
+    if [[ "$FINAL_COUNT" -ne 4 ]]; then
+        echo
+        echo "HATA: 4 modulun tamami fixli degil."
+        echo "Fixli modul sayisi: $FINAL_COUNT / 4"
+        exit 1
+    fi
+
+    echo
+    echo "OK: $KV icin PX13 audio fix kuruldu."
+
+done
+
+echo
+echo "============================================"
+echo "PX13 AUDIO AUTOFIX TAMAMLANDI"
+echo "============================================"
