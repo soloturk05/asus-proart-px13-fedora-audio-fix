@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic PX13 audio autofix retry
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=px13-audio-autofix.service
+
+[Install]
+WantedBy=timers.target

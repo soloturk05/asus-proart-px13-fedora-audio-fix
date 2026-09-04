@@ -1,0 +1,13 @@
+*.priv
+*.der
+MOK.*
+module-signing/
+*.key
+*.pem
+*.ko
+*.o
+*.rpm
+*.src.rpm
+linux-*/
+rpmbuild/
+px13-audio-autofix.log

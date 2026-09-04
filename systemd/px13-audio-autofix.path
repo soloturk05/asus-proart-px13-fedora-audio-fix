@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for new kernel installs and run PX13 audio autofix
+
+[Path]
+PathChanged=/usr/src/kernels
+PathChanged=/lib/modules
+Unit=px13-audio-autofix.service
+
+[Install]
+WantedBy=multi-user.target
